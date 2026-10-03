@@ -34,6 +34,8 @@ dependencies {
     testImplementation(libs.foliaScheduler)
     testImplementation(libs.junitApi)
     testImplementation(libs.junitParams)
+    testImplementation("org.mockito:mockito-core:5.19.0")
+    testRuntimeOnly(libs.commandApi)
     testRuntimeOnly(libs.junitEngine)
     testRuntimeOnly(libs.junitPlatformLauncher)
 }

@@ -17,6 +17,7 @@ import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerItemHeldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
@@ -24,10 +25,11 @@ import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.plugin.PluginDescriptionFile;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.util.HashSet;
+import java.util.Map;
 import java.util.Locale;
 import java.util.Optional;
-import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 
 /**
@@ -37,12 +39,41 @@ import java.util.logging.Level;
 public class EquipListener implements Listener {
     public static final EquipListener SINGLETON = new EquipListener();
 
-    private final Set<Player> dropCancelledPlayers;
-    private final Set<Player> ignoreGiveDropPlayers;
+    private final Map<UUID, Object> dropCancelledPlayers;
+    private final Map<UUID, Object> ignoreGiveDropPlayers;
 
     private EquipListener() {
-        dropCancelledPlayers = new HashSet<>();
-        ignoreGiveDropPlayers = new HashSet<>();
+        dropCancelledPlayers = new ConcurrentHashMap<>();
+        ignoreGiveDropPlayers = new ConcurrentHashMap<>();
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        UUID playerId = event.getPlayer().getUniqueId();
+        dropCancelledPlayers.remove(playerId);
+        ignoreGiveDropPlayers.remove(playerId);
+    }
+
+    public void clear() {
+        dropCancelledPlayers.clear();
+        ignoreGiveDropPlayers.clear();
+    }
+
+    private void markForCurrentTick(Map<UUID, Object> players, Player player) {
+        UUID playerId = player.getUniqueId();
+        Object marker = new Object();
+        players.put(playerId, marker);
+
+        // Missing inventory/drop callbacks must not leave a stale marker. Capture
+        // only the UUID, and do not let an older task remove a newer marker.
+        Runnable expire = () -> players.remove(playerId, marker);
+        boolean scheduled = false;
+        try {
+            scheduled = MechanicsCore.getInstance().getFoliaScheduler().entity(player).execute(expire, expire, 1);
+        } finally {
+            if (!scheduled)
+                expire.run();
+        }
     }
 
     @EventHandler
@@ -77,40 +108,49 @@ public class EquipListener implements Listener {
         // slot), then an equip event (If the item given to the player goes
         // into their hand).
         if (commandLine.startsWith("/give") || commandLine.startsWith("/minecraft:give")) {
+            UUID playerId = player.getUniqueId();
             Listener listener = new Listener() {
                 @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
                 public void onDrop(PlayerDropItemEvent event) {
-                    if (player.equals(event.getPlayer())) {
-                        ignoreGiveDropPlayers.add(player);
+                    if (playerId.equals(event.getPlayer().getUniqueId())) {
+                        markForCurrentTick(ignoreGiveDropPlayers, event.getPlayer());
                     }
                 }
             };
 
-            // Register, then unregister in 1 tick
-            Bukkit.getPluginManager().registerEvents(listener, MechanicsCore.getInstance());
-            MechanicsCore.getInstance().getFoliaScheduler().global().run(() -> HandlerList.unregisterAll(listener));
+            // Unregister on the player's next tick, retirement, or scheduling failure.
+            Runnable unregister = () -> HandlerList.unregisterAll(listener);
+            boolean scheduled = false;
+            try {
+                Bukkit.getPluginManager().registerEvents(listener, MechanicsCore.getInstance());
+                scheduled = MechanicsCore.getInstance().getFoliaScheduler().entity(player).execute(unregister, unregister, 1);
+            } finally {
+                if (!scheduled)
+                    unregister.run();
+            }
         }
     }
 
     @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
     public void onInventoryDrop(InventoryClickEvent event) {
         if (event.getSlot() == -999 && !isEmpty(event.getCursor()) && event.getWhoClicked() instanceof Player) {
-            ignoreGiveDropPlayers.add((Player) event.getWhoClicked());
+            markForCurrentTick(ignoreGiveDropPlayers, (Player) event.getWhoClicked());
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onDrop(PlayerDropItemEvent event) {
         Player player = event.getPlayer();
+        boolean ignoreDrop = ignoreGiveDropPlayers.remove(player.getUniqueId()) != null;
 
         // When a drop event is cancelled, the item is still removed from the
         // player's inventory, but it is reset later. This causes invalid equip
         // events. By adding cancelled events into the set, we can then filter
         // the "false" equip events.
         if (event.isCancelled()) {
-            dropCancelledPlayers.add(player);
+            markForCurrentTick(dropCancelledPlayers, player);
             return;
-        } else if (ignoreGiveDropPlayers.remove(player)) {
+        } else if (ignoreDrop) {
             return;
         }
 
@@ -139,13 +179,10 @@ public class EquipListener implements Listener {
 
     public void inject(Player player) {
         CompatibilityAPI.getEntityCompatibility().injectInventoryConsumer(player, (old, current, slot) -> {
-            if (isIllegalModification())
+            // Consume the marker even if an illegal modification returns early.
+            boolean cancelledDrop = dropCancelledPlayers.remove(player.getUniqueId()) != null;
+            if (isIllegalModification() || cancelledDrop)
                 return;
-
-            // Filters out cancelled PlayerDropItemEvent
-            if (dropCancelledPlayers.remove(player)) {
-                return;
-            }
 
             Bukkit.getPluginManager().callEvent(new EntityEquipmentEvent(player, slot, old, current));
         });

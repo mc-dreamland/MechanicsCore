@@ -54,6 +54,7 @@ public class MechanicsCore extends MechanicsPlugin {
 
     @Override
     public void onDisable() {
+        EquipListener.SINGLETON.clear();
         if (tickManager != null) {
             tickManager.shutdown();
             tickManager = null;
